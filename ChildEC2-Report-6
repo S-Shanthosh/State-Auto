@@ -1,0 +1,164 @@
+import boto3
+import json
+import csv
+from io import StringIO
+from datetime import datetime, timezone
+import logging
+from dateutil import parser
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def get_child_accounts():
+    org_client = boto3.client('organizations')
+    accounts = []
+    paginator = org_client.get_paginator('list_accounts')
+    for page in paginator.paginate():
+        for account in page['Accounts']:
+            if account['Status'] == 'ACTIVE' and account['Id'] != org_client.describe_organization()['Organization']['MasterAccountId']:
+                accounts.append({"id": account['Id'], "name": account['Name']})
+    return accounts
+
+def assume_role_and_get_client(account_id, role_name, region='us-east-1'):
+    sts_client = boto3.client('sts')
+    assumed_role_object = sts_client.assume_role(
+        RoleArn=f'arn:aws:iam::{account_id}:role/{role_name}',
+        RoleSessionName="AssumeRoleSession"
+    )
+    return boto3.client(
+        'ec2',
+        region_name=region,
+        aws_access_key_id=assumed_role_object['Credentials']['AccessKeyId'],
+        aws_secret_access_key=assumed_role_object['Credentials']['SecretAccessKey'],
+        aws_session_token=assumed_role_object['Credentials']['SessionToken']
+    )
+
+def get_stopped_instances(ec2_client):
+    response = ec2_client.describe_instances(
+        Filters=[
+            {
+                'Name': 'instance-state-name',
+                'Values': ['stopped']
+            }
+        ]
+    )
+    stopped_instances = []
+    for reservation in response['Reservations']:
+        for instance in reservation['Instances']:
+            instance_id = instance['InstanceId']
+            instance_name = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), 'N/A')
+            state_transition_reason = instance.get('StateTransitionReason', '')
+
+            launch_time = instance['LaunchTime'].replace(tzinfo=timezone.utc)
+            current_time = datetime.now(timezone.utc)
+
+            stop_time = None
+            stopped_days = None
+
+            # Try to parse stop time from StateTransitionReason
+            stop_time_str = state_transition_reason.split('(')[-1].strip(')') if 'User initiated' in state_transition_reason else ''
+            if stop_time_str and any(char.isdigit() for char in stop_time_str):
+                try:
+                    stop_time = parser.parse(stop_time_str).replace(tzinfo=timezone.utc)
+                    stopped_duration = current_time - stop_time
+                    stopped_days = stopped_duration.days
+                except ValueError as e:
+                    logger.warning(f"Couldn't parse stop time for instance {instance_id}: {e}")
+
+            # If we couldn't get stop time from StateTransitionReason, use launch time as a fallback
+            if stop_time is None:
+                stop_time = launch_time
+                stopped_duration = current_time - launch_time
+                stopped_days = stopped_duration.days
+
+            # Set a maximum threshold for stopped days (e.g., 5 years)
+            max_stopped_days = 5 * 365
+            if stopped_days > max_stopped_days:
+                logger.warning(f"Instance {instance_id} shows unusually long stop duration: {stopped_days} days")
+
+            stopped_instances.append({
+                'InstanceId': instance_id,
+                'InstanceName': instance_name,
+                'InstanceType': instance['InstanceType'],
+                'PrivateIP': instance.get('PrivateIpAddress', 'N/A'),
+                'VPCID': instance.get('VpcId', 'N/A'),
+                'SubnetID': instance.get('SubnetId', 'N/A'),
+                'LaunchTime': launch_time.strftime('%Y-%m-%d %H:%M:%S'),
+                'StopTime': stop_time.strftime('%Y-%m-%d %H:%M:%S'),
+                'StoppedDays': stopped_days
+            })
+
+    return stopped_instances
+
+def upload_csv_to_s3(instances, report_name):
+    csv_report = StringIO()
+    fieldnames = ['AccountId', 'AccountName', 'InstanceName', 'InstanceId', 'InstanceType', 'PrivateIP', 'VPCID', 'SubnetID', 'LaunchTime', 'StopTime', 'StoppedDays']
+    writer = csv.DictWriter(csv_report, fieldnames=fieldnames)
+    writer.writeheader()
+    for instance in instances:
+        writer.writerow(instance)
+
+    s3 = boto3.client('s3')
+    bucket_name = 'aws-ec2-recommend-test'
+    folder_name = 'EC2-Stopped-Instances-List-Child-Accounts'
+    file_name = f'{folder_name}/{report_name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    
+    s3.put_object(Bucket=bucket_name, Key=file_name, Body=csv_report.getvalue())
+    logger.info(f"Uploaded report to s3://{bucket_name}/{file_name}")
+
+def lambda_handler(event, context):
+    child_accounts = get_child_accounts()
+    region = 'us-east-1'
+    all_stopped_instances = []
+    processed_accounts = 0
+    accounts_with_errors = 0
+    accounts_with_no_instances = 0
+
+    logger.info(f"Total child accounts: {len(child_accounts)}")
+    logger.info(f"Attempting to process the following accounts: {[account['id'] for account in child_accounts]}")
+
+    for account in child_accounts:
+        logger.info(f"Processing account {account['name']} (ID: {account['id']})")
+        try:
+            ec2_client = assume_role_and_get_client(account['id'], 'OrganizationAccountAccessRole', region)
+            stopped_instances = get_stopped_instances(ec2_client)
+            
+            if stopped_instances:
+                for instance in stopped_instances:
+                    instance['AccountId'] = account['id']
+                    instance['AccountName'] = account['name']
+                    all_stopped_instances.append(instance)
+                logger.info(f"Retrieved {len(stopped_instances)} stopped instances from account {account['name']} (ID: {account['id']})")
+            else:
+                logger.info(f"No stopped instances found in account {account['name']} (ID: {account['id']})")
+                accounts_with_no_instances += 1
+            
+            processed_accounts += 1
+        except Exception as e:
+            logger.error(f"Error processing account {account['name']} (ID: {account['id']}): {str(e)}")
+            accounts_with_errors += 1
+
+    # Prepare and upload main CSV report
+    upload_csv_to_s3(all_stopped_instances, 'stopped_instances_report')
+
+    # Log summary
+    logger.info(f"Summary:")
+    logger.info(f"Total child accounts: {len(child_accounts)}")
+    logger.info(f"Accounts processed successfully: {processed_accounts}")
+    logger.info(f"Accounts with errors: {accounts_with_errors}")
+    logger.info(f"Accounts with no stopped instances: {accounts_with_no_instances}")
+    logger.info(f"Total stopped instances found: {len(all_stopped_instances)}")
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'message': 'Report uploaded to S3',
+            'summary': {
+                'total_accounts': len(child_accounts),
+                'processed_accounts': processed_accounts,
+                'accounts_with_errors': accounts_with_errors,
+                'accounts_with_no_instances': accounts_with_no_instances,
+                'total_stopped_instances': len(all_stopped_instances)
+            }
+        })
+    }
