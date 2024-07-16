@@ -115,7 +115,7 @@ def lambda_handler(event, context):
     for instance in all_stopped_instances:
         writer.writerow(instance)
 
-    # Upload CSV to S3 bucket
+    # Upload CSV to S3 
     try:
         s3 = boto3.client('s3')
         bucket_name = 'aws-ec2-recommend-test'
