@@ -1,0 +1,121 @@
+import boto3
+from datetime import datetime, timezone
+import logging
+from dateutil import parser
+import csv
+from io import StringIO
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def lambda_handler(event, context):
+    ec2_global = boto3.client('ec2')
+    s3 = boto3.client('s3')
+    
+    all_regions = [region['RegionName'] for region in ec2_global.describe_regions()['Regions']]
+    logger.info(f"Scanning {len(all_regions)} regions")
+    
+    instance_info = []
+    
+    for region in all_regions:
+        ec2 = boto3.client('ec2', region_name=region)
+        logger.info(f"Scanning region: {region}")
+        
+        response = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['stopped']}])
+        stopped_instances = [instance for reservation in response['Reservations'] for instance in reservation['Instances']]
+        
+        logger.info(f"Found {len(stopped_instances)} stopped instances in {region}")
+        
+        for instance in stopped_instances:
+            instance_id = instance['InstanceId']
+            instance_name = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), 'N/A')
+            state_transition_reason = instance.get('StateTransitionReason', '')
+            
+            stop_time_str = state_transition_reason.split('(')[-1].strip(')') if 'User initiated' in state_transition_reason else ''
+            if stop_time_str and any(char.isdigit() for char in stop_time_str):
+                try:
+                    stop_time = parser.parse(stop_time_str)
+                    stop_time_utc = stop_time.replace(tzinfo=timezone.utc)
+                    current_time = datetime.now(timezone.utc)
+                    stopped_duration = current_time - stop_time_utc
+                    stopped_days = stopped_duration.days
+                except ValueError as e:
+                    logger.error(f"Invalid date format for instance ID: {instance_id}, date string: {stop_time_str}, error: {e}")
+                    stop_time = None
+                    stopped_days = None
+            else:
+                stop_time = None
+                stopped_days = None
+            
+            # Get volume information
+            volumes = ec2.describe_volumes(Filters=[{'Name': 'attachment.instance-id', 'Values': [instance_id]}])['Volumes']
+            num_volumes = len(volumes)
+            total_volume_size = sum(volume['Size'] for volume in volumes)
+            volume_info = []
+            
+            for volume in volumes:
+                volume_id = volume['VolumeId']
+                volume_size = volume['Size']
+                snapshot_id = volume.get('SnapshotId', 'N/A')
+                
+                # Get snapshot creation date if available
+                snapshot_date = 'N/A'
+                if snapshot_id != 'N/A':
+                    try:
+                        snapshot = ec2.describe_snapshots(SnapshotIds=[snapshot_id])['Snapshots'][0]
+                        snapshot_date = snapshot['StartTime'].strftime('%Y-%m-%d %H:%M:%S')
+                    except Exception as e:
+                        logger.error(f"Error getting snapshot info for {snapshot_id}: {str(e)}")
+                
+                volume_info.append({
+                    'VolumeID': volume_id,
+                    'VolumeSize': volume_size,
+                    'SnapshotID': snapshot_id,
+                    'SnapshotDate': snapshot_date
+                })
+            
+            instance_info.append({
+                'InstanceName': instance_name,
+                'InstanceID': instance_id,
+                'InstanceType': instance['InstanceType'],
+                'PrivateIP': instance.get('PrivateIpAddress', 'N/A'),
+                'VPCID': instance.get('VpcId', 'N/A'),
+                'SubnetID': instance.get('SubnetId', 'N/A'),
+                'Region': region,
+                'LaunchTime': instance['LaunchTime'].strftime('%Y-%m-%d %H:%M:%S'),
+                'StopTime': stop_time.strftime('%Y-%m-%d %H:%M:%S') if stop_time else 'N/A',
+                'StoppedDays': stopped_days if stopped_days is not None else 'N/A',
+                'NumberOfVolumes': num_volumes,
+                'TotalVolumeSize': total_volume_size,
+                'VolumeInfo': volume_info
+            })
+    
+    logger.info(f"Total stopped instances found: {len(instance_info)}")
+    
+    csv_report = StringIO()
+    fieldnames = ['InstanceName', 'InstanceID', 'InstanceType', 'PrivateIP', 'VPCID', 'SubnetID', 'Region', 'LaunchTime', 'StopTime', 'StoppedDays', 'NumberOfVolumes', 'TotalVolumeSize', 'VolumeID', 'VolumeSize', 'SnapshotID', 'SnapshotDate']
+    writer = csv.DictWriter(csv_report, fieldnames=fieldnames)
+    writer.writeheader()
+    for instance in instance_info:
+        base_row = {k: v for k, v in instance.items() if k != 'VolumeInfo'}
+        if instance['VolumeInfo']:
+            for volume in instance['VolumeInfo']:
+                row = base_row.copy()
+                row.update(volume)
+                writer.writerow(row)
+        else:
+            writer.writerow(base_row)
+    
+    csv_report.seek(0)
+    
+    bucket_name = 'aws-ec2-recommend-test'
+    folder_name = 'EC2-Stopped-Instances-List-csv'
+    file_name = f'{folder_name}/stopped_instances_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    
+    try:
+        s3.put_object(Bucket=bucket_name, Key=file_name, Body=csv_report.getvalue())
+        logger.info(f"Successfully uploaded report to s3://{bucket_name}/{file_name}")
+        return {'statusCode': 200, 'body': f'Report uploaded successfully to S3 bucket: {bucket_name}/{file_name}'}
+    except Exception as e:
+        logger.error(f"Error uploading to S3: {str(e)}")
+        return {'statusCode': 500, 'body': f'Error uploading report: {str(e)}'}
