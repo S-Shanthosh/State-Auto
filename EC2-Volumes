@@ -93,15 +93,40 @@ def lambda_handler(event, context):
     logger.info(f"Total stopped instances found: {len(instance_info)}")
     
     csv_report = StringIO()
-    fieldnames = ['InstanceName', 'InstanceID', 'InstanceType', 'PrivateIP', 'VPCID', 'SubnetID', 'Region', 'LaunchTime', 'StopTime', 'StoppedDays', 'NumberOfVolumes', 'TotalVolumeSize', 'VolumeID', 'VolumeSize', 'SnapshotID', 'SnapshotDate']
+    fieldnames = ['InstanceName', 'InstanceID', 'StoppedDays', 'NumberOfVolumes', 'TotalVolumeSize', 
+                  'VolumeID', 'VolumeSize', 'SnapshotID', 'SnapshotDate']
     writer = csv.DictWriter(csv_report, fieldnames=fieldnames)
     writer.writeheader()
     for instance in instance_info:
-        base_row = {k: v for k, v in instance.items() if k != 'VolumeInfo'}
+        base_row = {
+            'InstanceName': instance['InstanceName'],
+            'InstanceID': instance['InstanceID'],
+            'StoppedDays': instance['StoppedDays'],
+            'NumberOfVolumes': instance['NumberOfVolumes'],
+            'TotalVolumeSize': instance['TotalVolumeSize']
+        }
         if instance['VolumeInfo']:
-            for volume in instance['VolumeInfo']:
+            for i, volume in enumerate(instance['VolumeInfo']):
                 row = base_row.copy()
-                row.update(volume)
+                if i == 0:  # Only write instance info for the first volume
+                    row.update({
+                        'VolumeID': volume['VolumeID'],
+                        'VolumeSize': volume['VolumeSize'],
+                        'SnapshotID': volume['SnapshotID'],
+                        'SnapshotDate': volume['SnapshotDate']
+                    })
+                else:
+                    row.update({
+                        'InstanceName': '',
+                        'InstanceID': '',
+                        'StoppedDays': '',
+                        'NumberOfVolumes': '',
+                        'TotalVolumeSize': '',
+                        'VolumeID': volume['VolumeID'],
+                        'VolumeSize': volume['VolumeSize'],
+                        'SnapshotID': volume['SnapshotID'],
+                        'SnapshotDate': volume['SnapshotDate']
+                    })
                 writer.writerow(row)
         else:
             writer.writerow(base_row)
