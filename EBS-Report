@@ -1,0 +1,137 @@
+import boto3
+from datetime import datetime, timezone, timedelta
+import logging
+from dateutil import parser
+import csv
+from io import StringIO
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def get_volume_metrics(ec2, volume_id):
+    try:
+        # Get volume metrics for the past 30 days
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=30)
+        
+        response = ec2.get_volume_statistics(
+            VolumeId=volume_id,
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=86400,  # 24 hours
+            MetricName=['VolumeReadBytes', 'VolumeWriteBytes']
+        )
+        
+        total_iops = 0
+        total_throughput = 0
+        for datapoint in response['Datapoints']:
+            total_iops += datapoint['VolumeReadBytes'] + datapoint['VolumeWriteBytes']
+            total_throughput += datapoint['VolumeReadBytes'] + datapoint['VolumeWriteBytes']
+        
+        return total_iops, total_throughput
+    
+    except Exception as e:
+        logger.error(f"Error getting volume metrics for {volume_id}: {str(e)}")
+        return 'N/A', 'N/A'
+
+def lambda_handler(event, context):
+    ec2_global = boto3.client('ec2')
+    s3 = boto3.client('s3')
+
+    all_regions = [region['RegionName'] for region in ec2_global.describe_regions()['Regions']]
+    logger.info(f"Scanning {len(all_regions)} regions")
+
+    instance_info = []
+
+    for region in all_regions:
+        ec2 = boto3.client('ec2', region_name=region)
+        logger.info(f"Scanning region: {region}")
+
+        # Get all instances
+        response = ec2.describe_instances()
+        all_instances = [instance for reservation in response['Reservations'] for instance in reservation['Instances']]
+
+        logger.info(f"Found {len(all_instances)} instances in {region}")
+
+        for instance in all_instances:
+            instance_id = instance['InstanceId']
+            instance_name = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), 'N/A')
+            instance_type = instance['InstanceType']
+
+            # Get volume information
+            volumes = ec2.describe_volumes(Filters=[{'Name': 'attachment.instance-id', 'Values': [instance_id]}])['Volumes']
+            num_volumes = len(volumes)
+            total_volume_size = sum(volume['Size'] for volume in volumes)
+
+            volume_info = []
+            for volume in volumes:
+                volume_id = volume['VolumeId']
+                volume_size = volume['Size']
+                volume_type = volume['VolumeType']
+                total_iops, total_throughput = get_volume_metrics(ec2, volume_id)
+                
+                # Recommend EBS type based on IOPS and Throughput
+                if total_iops > 16000 and total_throughput > 1000:
+                    recommended_type = 'io2'
+                elif total_iops > 3000 and total_throughput > 250:
+                    recommended_type = 'io1'
+                elif total_iops > 500 and total_throughput > 100:
+                    recommended_type = 'gp3'
+                else:
+                    recommended_type = 'gp2'
+                
+                volume_info.append({
+                    'VolumeID': volume_id,
+                    'VolumeSize': volume_size,
+                    'VolumeType': volume_type,
+                    'TotalIOPS': total_iops,
+                    'TotalThroughput': total_throughput,
+                    'RecommendedType': recommended_type
+                })
+
+            instance_info.append({
+                'InstanceName': instance_name,
+                'InstanceID': instance_id,
+                'InstanceType': instance_type,
+                'NumberOfVolumes': num_volumes,
+                'TotalVolumeSize': total_volume_size,
+                'VolumeInfo': volume_info
+            })
+
+    logger.info(f"Total instances found: {len(instance_info)}")
+
+    csv_report = StringIO()
+    fieldnames = ['InstanceName', 'InstanceID', 'InstanceType', 'NumberOfVolumes', 'TotalVolumeSize', 'VolumeID', 'VolumeSize', 'VolumeType', 'TotalIOPS', 'TotalThroughput', 'RecommendedType']
+    writer = csv.DictWriter(csv_report, fieldnames=fieldnames)
+    writer.writeheader()
+
+    for instance in instance_info:
+        for volume in instance['VolumeInfo']:
+            row = {
+                'InstanceName': instance['InstanceName'],
+                'InstanceID': instance['InstanceID'],
+                'InstanceType': instance['InstanceType'],
+                'NumberOfVolumes': instance['NumberOfVolumes'],
+                'TotalVolumeSize': instance['TotalVolumeSize'],
+                'VolumeID': volume['VolumeID'],
+                'VolumeSize': volume['VolumeSize'],
+                'VolumeType': volume['VolumeType'],
+                'TotalIOPS': volume['TotalIOPS'],
+                'TotalThroughput': volume['TotalThroughput'],
+                'RecommendedType': volume['RecommendedType']
+            }
+            writer.writerow(row)
+
+    csv_report.seek(0)
+
+    bucket_name = 'aws-ec2-recommend-test'
+    folder_name = 'EC2-EBS-Report-csv'
+    file_name = f'{folder_name}/ec2_ebs_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+
+    try:
+        s3.put_object(Bucket=bucket_name, Key=file_name, Body=csv_report.getvalue())
+        logger.info(f"Successfully uploaded report to s3://{bucket_name}/{file_name}")
+        return {'statusCode': 200, 'body': f'Report uploaded successfully to S3 bucket: {bucket_name}/{file_name}'}
+    except Exception as e:
+        logger.error(f"Error uploading to S3: {str(e)}")
+        return {'statusCode': 500, 'body': f'Error uploading report: {str(e)}'}
